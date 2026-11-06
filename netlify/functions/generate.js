@@ -1,11 +1,12 @@
+
 // Netlify Function: turns one chunk of extracted notes into reviewer JSON.
 // Works with a FREE Google Gemini key (GEMINI_API_KEY) or an Anthropic key (ANTHROPIC_API_KEY).
 // Secrets live ONLY in Netlify environment variables - never in the browser or on GitHub:
 //   GEMINI_API_KEY     - free key from aistudio.google.com (use this one if you can't pay)
 //   ANTHROPIC_API_KEY  - optional alternative
 //   ALLOWED_ORIGIN     - websites allowed to call this, comma-separated, no path, no trailing slash
-//   GEMINI_MODEL       - optional, defaults to gemini-2.5-flash (change if Google retires it)
-
+//   GEMINI_MODEL       - optional, tried first; backup models are tried automatically if it is busy
+ 
 const buildPrompt = (text, part, total) =>
   'You are a study assistant. Turn the notes below into a concise study reviewer. ' +
   'Use ONLY information found in the notes; never add outside facts. ' +
@@ -16,9 +17,8 @@ const buildPrompt = (text, part, total) =>
   'terms (array of {t: term, d: short definition}, 2 to 6 items), ' +
   'facts (array of short strings: dates, formulas, examples, exceptions that appear in the notes), ' +
   'quick (array of 2 to 3 short final-review strings).\n\n<notes>\n' + text + '\n</notes>';
-
-async function callGemini(key, prompt, signal) {
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+ 
+async function callGemini(key, prompt, signal, model) {
   const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
     method: 'POST', signal,
     headers: { 'x-goog-api-key': key, 'content-type': 'application/json' },
@@ -35,7 +35,7 @@ async function callGemini(key, prompt, signal) {
   const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
   return parts.map((p) => p.text || '').join('');
 }
-
+ 
 async function callAnthropic(key, prompt, signal) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST', signal,
@@ -53,7 +53,7 @@ async function callAnthropic(key, prompt, signal) {
   const data = await res.json();
   return (data.content || []).map((b) => b.text || '').join('');
 }
-
+ 
 exports.handler = async (event) => {
   const h = event.headers || {};
   const origin = h.origin || h.Origin || '';
@@ -71,14 +71,14 @@ exports.handler = async (event) => {
     headers: { 'Content-Type': 'application/json', ...cors },
     body: JSON.stringify(body),
   });
-
+ 
   if (event.httpMethod === 'OPTIONS') return { statusCode: originOk ? 204 : 403, headers: cors, body: '' };
   if (origin && !originOk) return reply(403, { error: 'This website is not allowed to use the AI service (check ALLOWED_ORIGIN)' });
   if (event.httpMethod !== 'POST') return reply(405, { error: 'Method not allowed' });
-
+ 
   const geminiKey = process.env.GEMINI_API_KEY, claudeKey = process.env.ANTHROPIC_API_KEY;
   if (!geminiKey && !claudeKey) return reply(500, { error: 'No GEMINI_API_KEY or ANTHROPIC_API_KEY is set in Netlify environment variables' });
-
+ 
   let text = '', part = 1, total = 1;
   try {
     const b = JSON.parse(event.body || '{}');
@@ -86,12 +86,24 @@ exports.handler = async (event) => {
     part = Number(b.part) || 1; total = Number(b.total) || 1;
   } catch (e) { return reply(400, { error: 'Invalid request' }); }
   if (text.length < 20) return reply(400, { error: 'Not enough text' });
-
+ 
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 8500);
   try {
     const prompt = buildPrompt(text, part, total);
-    const raw = geminiKey ? await callGemini(geminiKey, prompt, ctl.signal) : await callAnthropic(claudeKey, prompt, ctl.signal);
+    let raw;
+    if (geminiKey) {
+      // Try your chosen model first, then backups, if Google says a model is busy or unavailable.
+      const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'].filter(Boolean))];
+      let lastErr = null;
+      for (const m of models) {
+        try { raw = await callGemini(geminiKey, prompt, ctl.signal, m); lastErr = null; break; }
+        catch (err) { lastErr = err; if (![404, 429, 500, 503].includes(err.status)) throw err; }
+      }
+      if (lastErr) throw lastErr;
+    } else {
+      raw = await callAnthropic(claudeKey, prompt, ctl.signal);
+    }
     const match = raw.match(/\{[\s\S]*\}/);
     try { return reply(200, JSON.parse(match[0])); }
     catch (e) { return reply(502, { error: 'Unreadable AI response' }); }
